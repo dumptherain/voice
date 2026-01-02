@@ -10,6 +10,7 @@ import subprocess
 import signal
 import time
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -35,6 +36,13 @@ DEFAULT_CONFIG = {
     "bit_depth": 16,
     "lock_file": "/tmp/voice_rec.lock",
     "audio_file": "/tmp/voice_capture.wav",
+    "save_audio_file": True,
+    "saved_audio_quality": "high",
+    "high_quality_audio": {
+        "sample_rate": 44100,
+        "channels": 2,
+        "bit_depth": 24
+    },
     "filename_options": {
         "use_datetime": True,
         "create_dated_folders": True,
@@ -85,12 +93,22 @@ CONFIG = load_config()
 # Configuration variables (for backward compatibility and easier access)
 LOCK_FILE = CONFIG["lock_file"]
 AUDIO_FILE = CONFIG["audio_file"]
+HIGH_QUALITY_AUDIO_FILE = "/tmp/voice_capture_hq.wav"  # High quality recording
 TRANSCRIPTIONS_DIR = CONFIG["transcriptions_directory"]
 TRANSCRIPTIONS_FILE = CONFIG.get("transcriptions_file", "")  # Legacy support
 MODEL_NAME = CONFIG["model_name"]
 SAMPLE_RATE = CONFIG["sample_rate"]
 CHANNELS = CONFIG["channels"]
 BIT_DEPTH = CONFIG["bit_depth"]
+# High quality audio settings
+HQ_AUDIO_CONFIG = CONFIG.get("high_quality_audio", {
+    "sample_rate": 44100,
+    "channels": 2,
+    "bit_depth": 24
+})
+HQ_SAMPLE_RATE = HQ_AUDIO_CONFIG.get("sample_rate", 44100)
+HQ_CHANNELS = HQ_AUDIO_CONFIG.get("channels", 2)
+HQ_BIT_DEPTH = HQ_AUDIO_CONFIG.get("bit_depth", 24)
 
 # Audio recording command (prefer sox, fallback to ffmpeg)
 def get_recording_command():
@@ -166,6 +184,212 @@ def get_recording_command():
     raise RuntimeError("Neither sox nor ffmpeg found. Please install one of them.")
 
 
+def get_high_quality_recording_command():
+    """Get the appropriate high-quality recording command based on available tools"""
+    # Try PulseAudio first (common on KDE)
+    pulse_result = subprocess.run(["which", "pactl"], capture_output=True)
+    if pulse_result.returncode == 0:
+        # Check if PulseAudio is running
+        pa_check = subprocess.run(["pactl", "info"], capture_output=True)
+        if pa_check.returncode == 0:
+            # Use PulseAudio with ffmpeg
+            if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+                # Determine sample format based on bit depth
+                if HQ_BIT_DEPTH == 24:
+                    sample_fmt = "s32"  # ffmpeg uses 32-bit for 24-bit samples
+                elif HQ_BIT_DEPTH == 32:
+                    sample_fmt = "s32"
+                else:
+                    sample_fmt = "s16"
+                
+                return [
+                    "ffmpeg",
+                    "-f", "pulse",
+                    "-ar", str(HQ_SAMPLE_RATE),
+                    "-ac", str(HQ_CHANNELS),
+                    "-sample_fmt", sample_fmt,
+                    "-i", "default",  # PulseAudio default source
+                    "-y",  # Overwrite output file
+                    HIGH_QUALITY_AUDIO_FILE
+                ]
+    
+    # Check for sox (preferred for ALSA)
+    if subprocess.run(["which", "sox"], capture_output=True).returncode == 0:
+        # Use sox with ALSA device specification
+        return [
+            "sox",
+            "-t", "alsa",  # Specify ALSA input
+            "default",     # Use default ALSA device
+            "-r", str(HQ_SAMPLE_RATE),
+            "-c", str(HQ_CHANNELS),
+            "-b", str(HQ_BIT_DEPTH),
+            "-e", "signed-integer",
+            HIGH_QUALITY_AUDIO_FILE
+        ]
+    
+    # Fallback to ffmpeg with ALSA
+    if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+        # Determine sample format based on bit depth
+        if HQ_BIT_DEPTH == 24:
+            sample_fmt = "s32"  # ffmpeg uses 32-bit for 24-bit samples
+        elif HQ_BIT_DEPTH == 32:
+            sample_fmt = "s32"
+        else:
+            sample_fmt = "s16"
+        
+        # Try to find the default ALSA capture device
+        try:
+            arecord_result = subprocess.run(
+                ["arecord", "-l"], capture_output=True, text=True
+            )
+            if arecord_result.returncode == 0:
+                # Use hw:1,0 as default (first capture card, first device)
+                return [
+                    "ffmpeg",
+                    "-f", "alsa",
+                    "-ar", str(HQ_SAMPLE_RATE),
+                    "-ac", str(HQ_CHANNELS),
+                    "-sample_fmt", sample_fmt,
+                    "-i", "hw:1,0",  # Try first capture device explicitly
+                    "-y",
+                    HIGH_QUALITY_AUDIO_FILE
+                ]
+        except Exception:
+            pass
+        
+        # Last resort: use default
+        return [
+            "ffmpeg",
+            "-f", "alsa",
+            "-ar", str(HQ_SAMPLE_RATE),
+            "-ac", str(HQ_CHANNELS),
+            "-sample_fmt", sample_fmt,
+            "-i", "default",
+            "-y",
+            HIGH_QUALITY_AUDIO_FILE
+        ]
+    
+    raise RuntimeError("Neither sox nor ffmpeg found. Please install one of them.")
+
+
+def get_saved_audio_settings(quality):
+    """Get audio settings based on quality preset (low, medium, high)"""
+    quality = quality.lower()
+    
+    if quality == "low":
+        return {
+            "sample_rate": 16000,
+            "channels": 1,
+            "bit_depth": 16
+        }
+    elif quality == "medium":
+        return {
+            "sample_rate": 22050,
+            "channels": 1,
+            "bit_depth": 16
+        }
+    elif quality == "high":
+        return {
+            "sample_rate": 44100,
+            "channels": 2,
+            "bit_depth": 24
+        }
+    else:
+        # Default to high if invalid quality specified
+        print(f"Warning: Invalid quality '{quality}', using 'high'")
+        return {
+            "sample_rate": 44100,
+            "channels": 2,
+            "bit_depth": 24
+        }
+
+
+def convert_audio_quality(input_file, output_file, target_sample_rate, target_channels, target_bit_depth):
+    """Convert audio to specified quality settings"""
+    # Try ffmpeg first (better quality resampling)
+    if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+        # Determine sample format based on bit depth
+        if target_bit_depth == 24:
+            sample_fmt = "s32"  # ffmpeg uses 32-bit for 24-bit samples
+        elif target_bit_depth == 32:
+            sample_fmt = "s32"
+        else:
+            sample_fmt = "s16"
+        
+        cmd = [
+            "ffmpeg",
+            "-i", input_file,
+            "-ar", str(target_sample_rate),
+            "-ac", str(target_channels),
+            "-sample_fmt", sample_fmt,
+            "-y",  # Overwrite output file
+            output_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"Warning: ffmpeg conversion failed: {result.stderr[:200]}")
+    
+    # Fallback to sox
+    if subprocess.run(["which", "sox"], capture_output=True).returncode == 0:
+        cmd = [
+            "sox",
+            input_file,
+            "-r", str(target_sample_rate),
+            "-c", str(target_channels),
+            "-b", str(target_bit_depth),
+            "-e", "signed-integer",
+            output_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"Warning: sox conversion failed: {result.stderr[:200]}")
+    
+    return False
+
+
+def downsample_audio_for_transcription(input_file, output_file):
+    """Downsample high-quality audio to transcription-optimized format"""
+    # Try ffmpeg first (better quality resampling)
+    if subprocess.run(["which", "ffmpeg"], capture_output=True).returncode == 0:
+        cmd = [
+            "ffmpeg",
+            "-i", input_file,
+            "-ar", str(SAMPLE_RATE),
+            "-ac", str(CHANNELS),
+            "-sample_fmt", "s16",
+            "-y",  # Overwrite output file
+            output_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"Warning: ffmpeg downsampling failed: {result.stderr[:200]}")
+    
+    # Fallback to sox
+    if subprocess.run(["which", "sox"], capture_output=True).returncode == 0:
+        cmd = [
+            "sox",
+            input_file,
+            "-r", str(SAMPLE_RATE),
+            "-c", str(CHANNELS),
+            "-b", str(BIT_DEPTH),
+            "-e", "signed-integer",
+            output_file
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"Warning: sox downsampling failed: {result.stderr[:200]}")
+    
+    return False
+
+
 def send_notification(title, message, urgency="normal"):
     """Send desktop notification using notify-send"""
     try:
@@ -191,11 +415,11 @@ def start_recording():
         return False
     
     try:
-        # Get recording command
-        cmd = get_recording_command()
+        # Get high-quality recording command
+        cmd = get_high_quality_recording_command()
         
         # Debug: print the command being used
-        print(f"Using recording command: {' '.join(cmd)}")
+        print(f"Using high-quality recording command: {' '.join(cmd)}")
         
         # Start recording process
         # Use DEVNULL for stdout/stderr to avoid blocking, but log stderr to a file for debugging
@@ -235,21 +459,21 @@ def start_recording():
             send_notification("Voice Tool", f"Recording failed: {error_msg[:50]}", "critical")
             # Clean up
             try:
-                if os.path.exists(AUDIO_FILE):
-                    os.remove(AUDIO_FILE)
+                if os.path.exists(HIGH_QUALITY_AUDIO_FILE):
+                    os.remove(HIGH_QUALITY_AUDIO_FILE)
             except Exception:
                 pass
             return False
         
         # Verify the audio file is being created and growing
         initial_size = 0
-        if os.path.exists(AUDIO_FILE):
-            initial_size = os.path.getsize(AUDIO_FILE)
+        if os.path.exists(HIGH_QUALITY_AUDIO_FILE):
+            initial_size = os.path.getsize(HIGH_QUALITY_AUDIO_FILE)
         
         # Wait a bit more and check if file is growing (proves recording is working)
         time.sleep(0.5)
-        if os.path.exists(AUDIO_FILE):
-            new_size = os.path.getsize(AUDIO_FILE)
+        if os.path.exists(HIGH_QUALITY_AUDIO_FILE):
+            new_size = os.path.getsize(HIGH_QUALITY_AUDIO_FILE)
             if new_size > initial_size:
                 print(f"Recording verified: file growing ({initial_size} -> {new_size} bytes)")
             elif new_size == 0:
@@ -320,7 +544,7 @@ def stop_recording():
         except ProcessLookupError:
             print(f"Process {pid} not found (may have already terminated)")
             # Check if file exists and has content
-            if os.path.exists(AUDIO_FILE) and os.path.getsize(AUDIO_FILE) > 0:
+            if os.path.exists(HIGH_QUALITY_AUDIO_FILE) and os.path.getsize(HIGH_QUALITY_AUDIO_FILE) > 0:
                 print("Process is gone but audio file exists with content - proceeding with transcription")
             else:
                 print("Process is gone and no valid audio file found")
@@ -375,9 +599,9 @@ def stop_recording():
         # Give it time to flush buffers
         time.sleep(1.0)
         
-        # Check if audio file exists
-        if not os.path.exists(AUDIO_FILE):
-            print("Error: Audio file not found!")
+        # Check if high-quality audio file exists
+        if not os.path.exists(HIGH_QUALITY_AUDIO_FILE):
+            print("Error: High-quality audio file not found!")
             print("The recording process may have failed. Check microphone permissions and device selection.")
             # Check if process is still running (shouldn't be, but check anyway)
             try:
@@ -389,12 +613,11 @@ def stop_recording():
             return False
         
         # Check file size (should be > 0)
-        file_size = os.path.getsize(AUDIO_FILE)
+        file_size = os.path.getsize(HIGH_QUALITY_AUDIO_FILE)
         if file_size == 0:
-            print("Error: Audio file is empty!")
+            print("Error: High-quality audio file is empty!")
             print("This usually means the microphone wasn't detected or accessed correctly.")
             print("Try running: arecord -l  to see available devices")
-            print(f"Try testing manually: sox -t alsa default -r 16000 -c 1 -b 16 -e signed-integer /tmp/test.wav trim 0 2")
             send_notification("Voice Tool", "Error: Audio file is empty - check microphone", "critical")
             return False
         
@@ -403,10 +626,19 @@ def stop_recording():
             print(f"Warning: Audio file is very small ({file_size} bytes). Recording may have failed.")
             send_notification("Voice Tool", "Warning: Audio file is very small", "normal")
         
-        print("Recording stopped. Transcribing...")
+        print("Recording stopped. Downsampling for transcription...")
+        send_notification("Voice Tool", "Downsampling audio...", "normal")
+        
+        # Downsample high-quality audio for transcription
+        if not downsample_audio_for_transcription(HIGH_QUALITY_AUDIO_FILE, AUDIO_FILE):
+            print("Error: Failed to downsample audio for transcription")
+            send_notification("Voice Tool", "Error: Failed to downsample audio", "critical")
+            return False
+        
+        print("Transcribing...")
         send_notification("Voice Tool", "Transcribing audio...", "normal")
         
-        # Transcribe audio
+        # Transcribe audio (using downsampled version)
         transcribed_text = transcribe_audio()
         
         if not transcribed_text:
@@ -415,7 +647,43 @@ def stop_recording():
             return False
         
         # Save to file
-        save_transcription(transcribed_text)
+        transcription_filepath = save_transcription(transcribed_text)
+        
+        # Save audio file next to transcription if enabled
+        if CONFIG.get("save_audio_file", True) and transcription_filepath:
+            try:
+                # Get the base name of the transcription file and change extension to .wav
+                audio_filepath = transcription_filepath.with_suffix(".wav")
+                
+                # Get desired quality settings
+                saved_quality = CONFIG.get("saved_audio_quality", "high")
+                quality_settings = get_saved_audio_settings(saved_quality)
+                
+                # Convert high-quality audio to desired quality
+                temp_converted_file = "/tmp/voice_capture_converted.wav"
+                if convert_audio_quality(
+                    HIGH_QUALITY_AUDIO_FILE,
+                    temp_converted_file,
+                    quality_settings["sample_rate"],
+                    quality_settings["channels"],
+                    quality_settings["bit_depth"]
+                ):
+                    # Copy the converted file to the transcription directory
+                    shutil.copy2(temp_converted_file, audio_filepath)
+                    # Clean up temporary converted file
+                    try:
+                        os.remove(temp_converted_file)
+                    except Exception:
+                        pass
+                    quality_name = saved_quality.capitalize()
+                    print(f"{quality_name}-quality audio file saved to {audio_filepath}")
+                else:
+                    # Fallback: copy high-quality file if conversion fails
+                    print(f"Warning: Audio conversion failed, saving high-quality version instead")
+                    shutil.copy2(HIGH_QUALITY_AUDIO_FILE, audio_filepath)
+                    print(f"High-quality audio file saved to {audio_filepath}")
+            except Exception as e:
+                print(f"Warning: Could not save audio file: {e}")
         
         # Copy to clipboard
         try:
@@ -424,9 +692,13 @@ def stop_recording():
         except Exception as e:
             print(f"Warning: Could not copy to clipboard: {e}")
         
-        # Clean up audio file
+        # Clean up temporary audio files
         try:
-            os.remove(AUDIO_FILE)
+            os.remove(AUDIO_FILE)  # Remove downsampled version
+        except Exception:
+            pass
+        try:
+            os.remove(HIGH_QUALITY_AUDIO_FILE)  # Remove high-quality version
         except Exception:
             pass
         
@@ -520,6 +792,9 @@ def save_transcription(text):
         f.write("=" * 80 + "\n")
     
     print(f"Transcription saved to {filepath}")
+    
+    # Return the filepath so it can be used to save the audio file
+    return filepath
 
 
 def main():

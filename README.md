@@ -8,6 +8,9 @@ A Python-based voice-to-text utility optimized for Rocky Linux KDE (X11) that ac
 - **Automatic Transcription**: Uses faster-whisper with CPU/Int8 quantization for efficient processing
 - **Clipboard Integration**: Automatically copies transcribed text to X11 clipboard
 - **Flexible File Organization**: Configurable file naming with date/time stamps and optional dated folders
+- **Audio File Saving**: Optionally save the recorded audio file alongside transcriptions
+- **Quality Control**: Choose audio quality for saved files (low, medium, high)
+- **High-Quality Recording**: Records at high quality (44.1kHz stereo 24-bit) while using optimized settings for transcription
 - **Desktop Notifications**: Shows KDE notifications when recording starts/stops
 - **Keyboard Shortcut Ready**: Designed to work seamlessly with KDE custom shortcuts
 
@@ -24,6 +27,15 @@ The tool uses `config.json` in the project directory to customize settings. The 
 - **bit_depth**: Audio bit depth (default: 16)
 - **lock_file**: Lock file location (default: `/tmp/voice_rec.lock`)
 - **audio_file**: Temporary audio file location (default: `/tmp/voice_capture.wav`)
+- **save_audio_file**: Whether to save the audio file alongside transcriptions (default: `true`)
+- **saved_audio_quality**: Quality preset for saved audio files - `"low"`, `"medium"`, or `"high"` (default: `"high"`)
+  - **low**: 16kHz, mono, 16-bit (smaller files, suitable for voice)
+  - **medium**: 22.05kHz, mono, 16-bit (balanced quality)
+  - **high**: 44.1kHz, stereo, 24-bit (CD quality)
+- **high_quality_audio**: Object containing high-quality recording settings (used for recording, then converted for saving):
+  - **sample_rate**: Recording sample rate (default: `44100`)
+  - **channels**: Recording channels (default: `2` for stereo)
+  - **bit_depth**: Recording bit depth (default: `24`)
 - **filename_options**: Object containing file naming options:
   - **use_datetime**: Whether to include date/time in filename (default: `true`)
   - **create_dated_folders**: Whether to create a folder for each day (default: `true`)
@@ -37,12 +49,20 @@ The tool uses `config.json` in the project directory to customize settings. The 
 ```json
 {
     "transcriptions_directory": "~/Documents/transcriptions",
+    "transcriptions_file": "~/Documents/transcriptions.txt",
     "model_name": "base.en",
     "sample_rate": 16000,
     "channels": 1,
     "bit_depth": 16,
     "lock_file": "/tmp/voice_rec.lock",
     "audio_file": "/tmp/voice_capture.wav",
+    "save_audio_file": true,
+    "saved_audio_quality": "high",
+    "high_quality_audio": {
+        "sample_rate": 44100,
+        "channels": 2,
+        "bit_depth": 24
+    },
     "filename_options": {
         "use_datetime": true,
         "create_dated_folders": true,
@@ -57,16 +77,28 @@ The tool uses `config.json` in the project directory to customize settings. The 
 ### Filename Examples
 
 With default settings:
-- Files saved to: `~/Documents/transcriptions/2026-01-02/transcription_2026-01-02_20-30-45.txt`
+- Transcription saved to: `~/Documents/transcriptions/2026-01-02/transcription_2026-01-02_20-30-45.txt`
+- Audio file saved to: `~/Documents/transcriptions/2026-01-02/transcription_2026-01-02_20-30-45.wav` (if `save_audio_file` is `true`)
 
 With `"suffix": "meeting"`:
-- Files saved to: `~/Documents/transcriptions/2026-01-02/transcription_2026-01-02_20-30-45_meeting.txt`
+- Files saved to: `~/Documents/transcriptions/2026-01-02/transcription_2026-01-02_20-30-45_meeting.txt` and `.wav`
 
 With `"create_dated_folders": false`:
-- Files saved to: `~/Documents/transcriptions/transcription_2026-01-02_20-30-45.txt`
+- Files saved to: `~/Documents/transcriptions/transcription_2026-01-02_20-30-45.txt` and `.wav`
 
 With `"use_datetime": false` and `"suffix": "notes"`:
-- Files saved to: `~/Documents/transcriptions/transcription_notes.txt` (will overwrite if multiple per day)
+- Files saved to: `~/Documents/transcriptions/transcription_notes.txt` and `.wav` (will overwrite if multiple per day)
+
+### Audio Quality Settings
+
+The tool records at high quality (44.1kHz stereo 24-bit) for optimal audio preservation, then:
+- Uses an optimized version (16kHz mono 16-bit) for transcription (optimal for Whisper)
+- Converts and saves the audio file at the quality specified in `saved_audio_quality`
+
+To change the saved audio quality, edit `config.json` and set `"saved_audio_quality"` to:
+- `"low"` - Smaller files, suitable for voice-only recordings
+- `"medium"` - Balanced quality and file size
+- `"high"` - Best quality, larger files (default)
 
 ## Installation
 
@@ -130,8 +162,10 @@ source venv/bin/activate
 
 2. **Second Run**: 
    - Stops the recording process
+   - Downsamples the high-quality recording for transcription
    - Transcribes the audio using faster-whisper
    - Saves transcription to a file (with date/time in filename)
+   - Optionally saves the audio file (at configured quality) next to the transcription
    - Copies text to X11 clipboard
    - Shows a desktop notification with preview
 

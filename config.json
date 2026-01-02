@@ -7,6 +7,13 @@
     "bit_depth": 16,
     "lock_file": "/tmp/voice_rec.lock",
     "audio_file": "/tmp/voice_capture.wav",
+    "save_audio_file": true,
+    "saved_audio_quality": "high",
+    "high_quality_audio": {
+        "sample_rate": 44100,
+        "channels": 2,
+        "bit_depth": 24
+    },
     "filename_options": {
         "use_datetime": true,
         "create_dated_folders": true,
